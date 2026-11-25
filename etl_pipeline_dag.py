@@ -37,12 +37,25 @@ def users_pipeline():
 #Instantiate the data for airflow 
 users_pipeline()
 
-def users_pipeline():
+RAW_DIR = "$HOME/airflow/data/raw"   # raw files live outside dags/ so the dag-processor ignores them
+# Date of the run: the logical date, or the trigger time for manual runs that have none
+# (dag_run.logical_date is None for such runs; the bare `logical_date` variable is missing entirely)
+RUN_DATE = "(dag_run.logical_date or dag_run.run_after)"
+
+
+@dag(
+    dag_id="users_pipeline_bash",
+    start_date=datetime(2026, 11, 20),
+    schedule="@daily",
+    catchup=False,
+    tags=["etl", "lux", "bash"]
+)
+def users_pipeline_bash():
 
     # Use bash operators to check the project files, where they are and where we expect them
     check_files = BashOperator(
         task_id="check_files",
-        bash_command=f"cd {PROJ_DIR} && ls etl_pipeline.py .env $$ echo 'Project files found'"
+        bash_command=f"cd {PROJ_DIR} && ls etl_pipeline.py .env && echo 'Project files found'"
     )
 
     #2. Bash operator to run airflow orchestration as we would in terminal
@@ -53,15 +66,15 @@ def users_pipeline():
     
     #3. Let's get a message to see the run dates of the pipeline
     last_update = BashOperator(
-        task_is="last_update",
-        bash_command="echo 'Pipeline last update for {{ ds }}"
+        task_id="last_update",
+        bash_command="echo 'Pipeline last update for {{ " + RUN_DATE + ".strftime('%Y-%m-%d') }}'"
     )
 
-    #Skipping saturday and sunday
+    #Skipping saturday and sunday (exit code 99 = BashOperator marks the task as skipped)
     weekdays_only = BashOperator(
         task_id="weekdays_only",
-        bashcommand=(
-            "DAY={{ macros.ds_format(ds, '%Y-%m-%d', '%u')}};"
+        bash_command=(
+            "DAY={{ " + RUN_DATE + ".strftime('%u') }};"   # 1=Mon ... 7=Sun
             "echo \"Day of the week: $DAY\";"
             "if [ \"$DAY\" -ge 6 ]; then echo 'weekend: skipping'; exit 99; fi"
         ),
@@ -70,15 +83,18 @@ def users_pipeline():
     #Compress raw files older than 7 days and delete compressed files older than 30 days
     clean_up = BashOperator(
         task_id="clean_up",
-        bashcommand=(
-            f"cd {PROJ_DIR}/data/raw &&"
-            "fnd . -name '*.json' -mtime +7 -exec gzip -f {} + ;"
-            "find . -name '*.json' -mtime +30 -delete ; "
+        bash_command=(
+            # stop here if the folder can't be entered, so find never runs in the wrong place
+            f"mkdir -p {RAW_DIR} && cd {RAW_DIR} || exit 1;"
+            "find . -name '*.json' -mtime +7 -exec gzip -f {} + ;"
+            "find . -name '*.json.gz' -mtime +30 -delete ; "
             "echo \"Files Kept: $(ls | wc -l)\" "
         ),
         trigger_rule="none_failed",
     )
 
-    check_files >> run_pipeline >> last_update >> weekdays_only >> clean_up
+    # weekday check comes before the load, so weekends skip run_pipeline and last_update;
+    # clean_up (trigger_rule="none_failed") still runs after a skip
+    check_files >> weekdays_only >> run_pipeline >> last_update >> clean_up
 
-users_pipeline()
+users_pipeline_bash()
