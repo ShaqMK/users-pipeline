@@ -4,18 +4,28 @@ A small ETL (Extract, Transform, Load) pipeline. It pulls user records from a pu
 
 The pipeline was first written as a standalone script in `~/data-engineering-lux/etl-s01/`. It was then copied into this Airflow `dags/` folder and wrapped in a DAG.
 
+`etl_pipeline_dag.py` defines two DAGs that run the same ETL in different ways:
+
+| DAG | Built with | What it adds | Default state |
+|-----|------------|--------------|---------------|
+| `users_pipeline` | Python `@task` functions (TaskFlow API) | Nothing; plain extract → transform → load | Paused |
+| `users_pipeline_bash` | `BashOperator` shell commands | Checks the project files, skips the load on weekends, cleans up old raw files | **Active** |
+
+Only one of them should be unpaused at a time. Both load into the same `users` table.
+
 ---
 
 ## Table of Contents
 
 1. [How It Works](#how-it-works)
-2. [Project Structure](#project-structure)
-3. [Prerequisites](#prerequisites)
-4. [Setup](#setup)
-5. [Running the Pipeline](#running-the-pipeline)
-6. [Verifying the Setup](#verifying-the-setup)
-7. [Stopping Airflow](#stopping-airflow)
-8. [Troubleshooting](#troubleshooting)
+2. [The Bash DAG: users_pipeline_bash](#the-bash-dag-users_pipeline_bash)
+3. [Project Structure](#project-structure)
+4. [Prerequisites](#prerequisites)
+5. [Setup](#setup)
+6. [Running the Pipeline](#running-the-pipeline)
+7. [Verifying the Setup](#verifying-the-setup)
+8. [Stopping Airflow](#stopping-airflow)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -35,9 +45,9 @@ The pipeline was first written as a standalone script in `~/data-engineering-lux
 | **Transform** | `transform(raw_data)` | Flattens each user into a record. It collapses extra whitespace (`clean_text`), strips phone numbers down to digits and drops extensions (`clean_phone`), defaults a missing city to `"unknown"` and lowercases emails. Records with no id or name, or with an invalid email, are skipped. |
 | **Load** | `load(clean_users)` | Connects to PostgreSQL using `DATABASE_URL`. It creates the `users` table if it doesn't exist, then **upserts** every record (`INSERT ... ON CONFLICT (user_id) DO UPDATE`), so re-runs are idempotent. |
 
-The three stages pass data to each other through Airflow **XComs**, using the TaskFlow API (`@dag` / `@task`).
+In `users_pipeline`, the three stages pass data to each other through Airflow **XComs**, using the TaskFlow API (`@dag` / `@task`). `users_pipeline_bash` runs all three stages in one task instead (see below).
 
-### DAG details
+### DAG details: users_pipeline
 
 | Property | Value |
 |----------|-------|
@@ -64,6 +74,189 @@ CREATE TABLE IF NOT EXISTS users (
 
 ---
 
+## The Bash DAG: users_pipeline_bash
+
+This DAG runs the same ETL, but each step is a **shell command**, run by Airflow's `BashOperator` the same way you'd type it in a terminal. It also adds a weekend check and a cleanup step.
+
+```
+┌─────────────┐   ┌───────────────┐   ┌──────────────┐   ┌─────────────┐   ┌──────────┐
+│ check_files │──▶│ weekdays_only │──▶│ run_pipeline │──▶│ last_update │──▶│ clean_up │
+└─────────────┘   └───────────────┘   └──────────────┘   └─────────────┘   └──────────┘
+ project files      Sat/Sun → skip      python               print run         gzip / delete
+ present?           the rest            etl_pipeline.py      date              old raw files
+```
+
+| Property | Value |
+|----------|-------|
+| `dag_id` | `users_pipeline_bash` |
+| Schedule | `@daily` (00:00 UTC = 03:00 Nairobi time) |
+| Start date | `2026-11-20` |
+| Catchup | `False` |
+| Tags | `etl`, `lux`, `bash` |
+
+### What happens on each day
+
+| Day | `check_files` | `weekdays_only` | `run_pipeline` | `last_update` | `clean_up` | Run result |
+|-----|---------------|-----------------|----------------|---------------|------------|------------|
+| Mon–Fri | ✅ success | ✅ success | ✅ success | ✅ success | ✅ success | success |
+| Sat–Sun | ✅ success | ⏭ skipped | ⏭ skipped | ⏭ skipped | ✅ success | success |
+
+On weekends `weekdays_only` itself appears **skipped** (pink) in the UI. That's expected, not an error (see [exit code 99](#how-the-weekend-skip-works)).
+
+### Variables used by the commands
+
+```python
+PROJ_DIR = "$HOME/airflow/dags"
+RAW_DIR  = "$HOME/airflow/data/raw"
+RUN_DATE = "(dag_run.logical_date or dag_run.run_after)"
+```
+
+- **`PROJ_DIR` / `RAW_DIR`** contain `$HOME`, which **bash** expands to your home folder (`/home/<you>`) when the command runs. Python leaves it as plain text.
+- **`RAW_DIR`** is outside `dags/` on purpose. The dag-processor scans everything in `dags/`, so data files shouldn't live there.
+- **`RUN_DATE`** is a Jinja expression (see [Jinja templates](#jinja-templates-the--parts)) for the date the run is *for*. Scheduled runs have a `logical_date`. Runs triggered manually from the UI or CLI usually don't, so it falls back to `run_after`, the time the run was triggered. It must be written as `dag_run.logical_date`: when a run has no logical date, Airflow leaves the bare `logical_date` variable out entirely, and the template fails with `'logical_date' is undefined`.
+
+### Task by task
+
+#### 1. `check_files`: are the project files where we expect them?
+
+```bash
+cd $HOME/airflow/dags && ls etl_pipeline.py .env && echo 'Project files found'
+```
+
+| Part | Meaning |
+|------|---------|
+| `cd $HOME/airflow/dags` | Move into the DAGs folder. |
+| `&&` | "Only run the next command if the previous one succeeded." If `cd` fails, nothing after it runs and the task fails. |
+| `ls etl_pipeline.py .env` | List those two files. `ls` exits with an error if either one is missing, which fails the task. |
+| `echo 'Project files found'` | Print a confirmation to the task log. It only runs if both files exist. |
+
+This catches a missing script or `.env` *before* anything else runs.
+
+#### 2. `weekdays_only`: skip the rest on Saturday and Sunday
+
+What's in the DAG file:
+
+```bash
+DAY={{ (dag_run.logical_date or dag_run.run_after).strftime('%u') }};
+echo "Day of the week: $DAY";
+if [ "$DAY" -ge 6 ]; then echo 'weekend: skipping'; exit 99; fi
+```
+
+What bash actually receives after Airflow fills in the template, e.g. on a Wednesday:
+
+```bash
+DAY=3;echo "Day of the week: $DAY";if [ "$DAY" -ge 6 ]; then echo 'weekend: skipping'; exit 99; fi
+```
+
+| Part | Meaning |
+|------|---------|
+| `{{ ... .strftime('%u') }}` | Airflow replaces this with the run date's **ISO weekday number**: `1` = Monday … `5` = Friday, `6` = Saturday, `7` = Sunday. |
+| `DAY=3` | Create a shell variable `DAY`. There must be **no spaces** around `=` in bash. |
+| `;` | Command separator: run the next command whether or not the previous one succeeded. |
+| `echo "Day of the week: $DAY"` | Print the value. `$DAY` reads the variable. Double quotes let bash expand it. |
+| `if [ ... ]; then ...; fi` | A bash *if* block. `[ ... ]` is the test, and `fi` ("if" backwards) closes the block. |
+| `"$DAY" -ge 6` | "Is `DAY` **g**reater than or **e**qual to 6?", i.e. Saturday or Sunday. `-ge` is for numbers; `>=` doesn't work inside `[ ]`. |
+| `exit 99` | Stop the script with exit code 99. |
+
+##### How the weekend skip works
+
+Every shell command ends with an **exit code**. BashOperator turns it into a task state:
+
+| Exit code | Task state |
+|-----------|------------|
+| `0` | success |
+| `99` | **skipped** (BashOperator's default `skip_on_exit_code`) |
+| anything else | failed |
+
+When `weekdays_only` is skipped, the tasks after it that use the default trigger rule (`all_success`) are skipped too. That covers `run_pipeline` and `last_update`, so **nothing is loaded on weekends**. The check runs *before* `run_pipeline` on purpose: if it ran afterwards, the load would already have happened.
+
+#### 3. `run_pipeline`: run the ETL script
+
+```bash
+cd $HOME/airflow/dags && python etl_pipeline.py
+```
+
+| Part | Meaning |
+|------|---------|
+| `cd $HOME/airflow/dags` | Move into the folder that has `etl_pipeline.py` and `.env`. |
+| `&& python etl_pipeline.py` | Run the whole extract → transform → load script, exactly like running it in a terminal. If the script raises an error, it exits with a non-zero code and the task fails. |
+
+`python` is found through the `PATH` of the Airflow process. Because the scheduler was started inside `~/airflow/.venv`, it's the venv's Python, which has `requests`, `psycopg2` and `python-dotenv` installed. Everything the script prints (`[EXTRACT] ...`, `[LOAD] 10 rows ...`) shows up in the task log.
+
+#### 4. `last_update`: log the run date
+
+```bash
+echo 'Pipeline last update for {{ (dag_run.logical_date or dag_run.run_after).strftime('%Y-%m-%d') }}'
+```
+
+Airflow fills in the date, so bash runs e.g. `echo 'Pipeline last update for 2026-11-25'`. `strftime('%Y-%m-%d')` formats the date as year-month-day.
+
+#### 5. `clean_up`: compress and delete old raw files
+
+```bash
+mkdir -p $HOME/airflow/data/raw && cd $HOME/airflow/data/raw || exit 1;
+find . -name '*.json' -mtime +7 -exec gzip -f {} + ;
+find . -name '*.json.gz' -mtime +30 -delete ;
+echo "Files Kept: $(ls | wc -l)"
+```
+
+**Line 1: go to the raw folder, or stop**
+
+| Part | Meaning |
+|------|---------|
+| `mkdir -p <dir>` | Create the folder, including any missing parent folders. `-p` also means "no error if it already exists". |
+| `&& cd <dir>` | Then move into it. |
+| `\|\| exit 1` | `\|\|` means "only run the next command if the previous one **failed**". If the folder can't be created or entered, stop with code 1 (task fails). This is a safety guard: without it, the `find ... -delete` below would run in whatever folder the task happened to start in. |
+
+**Line 2: gzip raw files older than 7 days**
+
+| Part | Meaning |
+|------|---------|
+| `find .` | Search the current folder (`.`) and its subfolders. |
+| `-name '*.json'` | Only files whose name ends in `.json`. The single quotes stop bash from expanding `*` itself, so `find` gets the pattern. |
+| `-mtime +7` | Last **m**odified more than 7 full days ago. `find` counts in whole 24-hour periods and ignores fractions, so `+7` matches files at least 8 days old. |
+| `-exec gzip -f {} +` | Run `gzip` on the matches. `{}` is replaced with the file names, and `+` passes many files to one `gzip` call. `gzip` replaces `file.json` with `file.json.gz` and **keeps the original modification time**. `-f` (force) overwrites a `.gz` with the same name if one exists. |
+
+**Line 3: delete compressed files older than 30 days**
+
+| Part | Meaning |
+|------|---------|
+| `-name '*.json.gz'` | Only compressed files. |
+| `-mtime +30` | Older than 30 full days. Because `gzip` kept the original timestamp, this counts from when the raw file was saved, not when it was compressed. |
+| `-delete` | Delete the matches. There's no confirmation or recycle bin, which is why line 1 has the `\|\| exit 1` guard. |
+
+**Line 4: report**
+
+| Part | Meaning |
+|------|---------|
+| `$(ls \| wc -l)` | *Command substitution*: run `ls \| wc -l` and insert its output. `ls` lists the files, and `\|` (pipe) sends that list to `wc -l`, which counts the lines, i.e. the number of files left. |
+
+**`trigger_rule="none_failed"`**: by default a task only runs if everything before it **succeeded**. `none_failed` means "run as long as nothing before me **failed**", so skipped is fine. That's why `clean_up` still runs on weekends. If the pipeline actually fails, `clean_up` doesn't run, and the DAG run is still marked failed.
+
+> **Note:** `etl_pipeline.py` doesn't save raw API responses to disk. `clean_up` only has work to do when something writes `*.json` files into `~/airflow/data/raw/`. Until then it just reports how many files are there.
+
+### Jinja templates (the `{{ }}` parts)
+
+`bash_command` is a **templated field**. Before running the command, Airflow replaces anything inside `{{ ... }}` with a value from the run, using the Jinja template language. Python f-strings are filled in once, when the DAG file is parsed; Jinja is filled in at run time, for each run. Inside an f-string, `{{` turns into a single `{`, which would break the Jinja `{{ }}`. That's why the templated commands are built by joining plain strings with `+` around `RUN_DATE`, and f-strings are only used where there's no Jinja (`PROJ_DIR`, `RAW_DIR`).
+
+To see exactly what was run, open a task's log in the UI. The line `Running command: ['/usr/bin/bash', '-c', '...']` shows the final command after templating.
+
+### Bash quick reference
+
+| Symbol | Meaning | Example from this DAG |
+|--------|---------|-----------------------|
+| `&&` | Run next only if previous **succeeded** | `cd ... && ls ...` |
+| `\|\|` | Run next only if previous **failed** | `cd ... \|\| exit 1` |
+| `;` | Run next regardless | `DAY=3; echo ...` |
+| `\|` | Pipe output of one command into another | `ls \| wc -l` |
+| `$VAR` | Read a variable | `$DAY`, `$HOME` |
+| `$( ... )` | Insert a command's output | `$(ls \| wc -l)` |
+| `'...'` | Literal text, no expansion | `'*.json'` |
+| `"..."` | Text with `$VAR` expanded | `"Day of the week: $DAY"` |
+| `exit N` | End with exit code N (0 = success) | `exit 99`, `exit 1` |
+
+---
+
 ## Project Structure
 
 ```
@@ -73,9 +266,10 @@ CREATE TABLE IF NOT EXISTS users (
 ├── airflow.db                  # SQLite metadata database (auto-generated)
 ├── simple_auth_manager_passwords.json.generated   # UI login (auto-generated)
 ├── logs/                       # Task logs + service logs
+├── data/raw/                   # Raw files cleaned up by users_pipeline_bash (created on first run)
 └── dags/                       # ← this repository
     ├── etl_pipeline.py         # extract / transform / load functions
-    ├── etl_pipeline_dag.py     # Airflow DAG definition (users_pipeline)
+    ├── etl_pipeline_dag.py     # both DAGs: users_pipeline and users_pipeline_bash
     ├── hello_dag.py            # placeholder (empty)
     ├── .env                    # DATABASE_URL (not committed)
     └── .gitignore              # ignores .env
@@ -239,14 +433,19 @@ cat ~/airflow/simple_auth_manager_passwords.json.generated
 
 ### Trigger the DAG
 
-New DAGs start **paused**. Unpause and trigger the DAG from the UI (search for `users_pipeline`), or from the CLI:
+New DAGs start **paused**. Unpause **one** of the two DAGs. To use the bash version (recommended):
 
 ```bash
-airflow dags unpause users_pipeline
-airflow dags trigger users_pipeline
+airflow dags pause users_pipeline          # make sure the Python version is off
+airflow dags unpause users_pipeline_bash
+airflow dags trigger users_pipeline_bash   # run it now instead of waiting for 00:00 UTC
 ```
 
-After that it runs automatically once a day.
+Or do the same from the UI: search for `users_pipeline_bash` and use the pause toggle and the **Trigger** button. After that it runs automatically once a day.
+
+> A run triggered on a **paused** DAG stays `queued` and never starts. Unpause it first. To test a DAG without unpausing it, run `airflow dags test <dag_id> <YYYY-MM-DD>`, which runs every task right away for that date. A Saturday date is a quick way to check the weekend skip.
+
+To see what each command printed, open the DAG in the UI, click a task in the **Graph** or **Grid** view, then open **Logs**.
 
 ---
 
@@ -259,8 +458,14 @@ airflow db check
 # Did any DAG file fail to import? (should print "No data found")
 airflow dags list-import-errors
 
-# Is users_pipeline registered?
+# Are both DAGs registered? (and which one is paused)
 airflow dags list | grep users_pipeline
+
+# Tasks in the bash DAG (should list 5)
+airflow tasks list users_pipeline_bash
+
+# Recent runs and their states
+airflow dags list-runs users_pipeline_bash
 
 # Force DAGs to be re-parsed after editing files
 airflow dags reserialize
@@ -309,3 +514,10 @@ pgrep -fl airflow     # should print nothing
 | `load_task` fails with a connection error | Check `DATABASE_URL` in `dags/.env` and confirm PostgreSQL is reachable. Running `python3 etl_pipeline.py` reproduces the error outside Airflow. |
 | Many example DAGs (e.g. `aggregate_regional_sales`) in the list | These are Airflow's bundled examples. To hide them, set `load_examples = False` in `airflow.cfg` and restart the services. |
 | `airflow: command not found` | The virtual environment isn't active. Run `source ~/airflow/.venv/bin/activate`. |
+| UI shows only 3 tasks | You're looking at `users_pipeline`. The bash version is `users_pipeline_bash`, which has 5 tasks. Both are defined in the same file. |
+| Triggered run stays `queued` | The DAG is paused. Unpause it, or test it with `airflow dags test`. |
+| `'logical_date' is undefined` in a task log | A template uses the bare `logical_date` variable, which is missing for runs triggered without a date. Use `dag_run.logical_date` instead (as `RUN_DATE` does). |
+| `weekdays_only` is pink/skipped | Expected on Saturday and Sunday: the command exited with code 99. Check the log for `Day of the week: 6` or `7`. |
+| `TypeError: ... missing 1 required keyword-only argument: 'task_id'` | A typo in an operator's `task_id=` argument (e.g. `task_is=`). Every operator needs a `task_id`. |
+| `ls: cannot access ...` in `check_files` | `etl_pipeline.py` or `.env` is missing from `~/airflow/dags/`. |
+| The data is loaded twice a day | Both `users_pipeline` and `users_pipeline_bash` are unpaused. Pause one. |
