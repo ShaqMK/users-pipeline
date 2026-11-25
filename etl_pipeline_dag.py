@@ -1,7 +1,7 @@
 from datetime import datetime
 from airflow.sdk import dag, task
 from etl_pipeline import extract, transform, load
-from airflow.providers.standard.operators.bash import bashOperator
+from airflow.providers.standard.operators.bash import BashOperator
 
 PROJ_DIR = "$HOME/airflow/dags"
 
@@ -40,25 +40,25 @@ users_pipeline()
 def users_pipeline():
 
     # Use bash operators to check the project files, where they are and where we expect them
-    check_files = bashOperator(
+    check_files = BashOperator(
         task_id="check_files",
         bash_command=f"cd {PROJ_DIR} && ls etl_pipeline.py .env $$ echo 'Project files found'"
     )
 
     #2. Bash operator to run airflow orchestration as we would in terminal
-    run_pipeline = bashOperator(
+    run_pipeline = BashOperator(
         task_id="run_pipeline",
         bash_command=f"cd {PROJ_DIR} && python etl_pipeline.py"
     )
     
     #3. Let's get a message to see the run dates of the pipeline
-    last_update = bashOperator(
+    last_update = BashOperator(
         task_is="last_update",
         bash_command="echo 'Pipeline last update for {{ ds }}"
     )
 
     #Skipping saturday and sunday
-    weekdays_only = bashOperator(
+    weekdays_only = BashOperator(
         task_id="weekdays_only",
         bashcommand=(
             "DAY={{ macros.ds_format(ds, '%Y-%m-%d', '%u')}};"
@@ -68,7 +68,7 @@ def users_pipeline():
     )
 
     #Compress raw files older than 7 days and delete compressed files older than 30 days
-    clean_up = bashOperator(
+    clean_up = BashOperator(
         task_id="clean_up",
         bashcommand=(
             f"cd {PROJ_DIR}/data/raw &&"
