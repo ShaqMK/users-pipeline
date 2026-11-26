@@ -93,6 +93,15 @@ def users_pipeline_bash():
         trigger_rule="none_failed",
     )
 
+    #Bash operators inclusive of referencing
+    summary = BashOperator(
+        task_id="summary",
+        bash_command=(
+            "echo 'Today: {{ ds }}' ; "
+            "echo 'Yesterday: {{ macros.ds_add(ds, -1) }}'"
+        )
+    )
+
     # weekday check comes before the load, so weekends skip run_pipeline and last_update;
     # clean_up (trigger_rule="none_failed") still runs after a skip
     check_files >> weekdays_only >> run_pipeline >> last_update >> clean_up
