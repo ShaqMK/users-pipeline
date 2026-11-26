@@ -19,13 +19,14 @@ Only one of them should be unpaused at a time. Both load into the same `users` t
 
 1. [How It Works](#how-it-works)
 2. [The Bash DAG: users_pipeline_bash](#the-bash-dag-users_pipeline_bash)
-3. [Project Structure](#project-structure)
-4. [Prerequisites](#prerequisites)
-5. [Setup](#setup)
-6. [Running the Pipeline](#running-the-pipeline)
-7. [Verifying the Setup](#verifying-the-setup)
-8. [Stopping Airflow](#stopping-airflow)
-9. [Troubleshooting](#troubleshooting)
+3. [Jinja Templates](#jinja-templates)
+4. [Project Structure](#project-structure)
+5. [Prerequisites](#prerequisites)
+6. [Setup](#setup)
+7. [Running the Pipeline](#running-the-pipeline)
+8. [Verifying the Setup](#verifying-the-setup)
+9. [Stopping Airflow](#stopping-airflow)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -113,7 +114,7 @@ RUN_DATE = "(dag_run.logical_date or dag_run.run_after)"
 
 - **`PROJ_DIR` / `RAW_DIR`** contain `$HOME`, which **bash** expands to your home folder (`/home/<you>`) when the command runs. Python leaves it as plain text.
 - **`RAW_DIR`** is outside `dags/` on purpose. The dag-processor scans everything in `dags/`, so data files shouldn't live there.
-- **`RUN_DATE`** is a Jinja expression (see [Jinja templates](#jinja-templates-the--parts)) for the date the run is *for*. Scheduled runs have a `logical_date`. Runs triggered manually from the UI or CLI usually don't, so it falls back to `run_after`, the time the run was triggered. It must be written as `dag_run.logical_date`: when a run has no logical date, Airflow leaves the bare `logical_date` variable out entirely, and the template fails with `'logical_date' is undefined`.
+- **`RUN_DATE`** is a Jinja expression (see [Jinja Templates](#jinja-templates)) for the date the run is *for*. Scheduled runs have a `logical_date`. Runs triggered manually from the UI or CLI usually don't, so it falls back to `run_after`, the time the run was triggered. It must be written as `dag_run.logical_date`: when a run has no logical date, Airflow leaves the bare `logical_date` variable out entirely, and the template fails with `'logical_date' is undefined`.
 
 ### Task by task
 
@@ -235,11 +236,7 @@ echo "Files Kept: $(ls | wc -l)"
 
 > **Note:** `etl_pipeline.py` doesn't save raw API responses to disk. `clean_up` only has work to do when something writes `*.json` files into `~/airflow/data/raw/`. Until then it just reports how many files are there.
 
-### Jinja templates (the `{{ }}` parts)
-
-`bash_command` is a **templated field**. Before running the command, Airflow replaces anything inside `{{ ... }}` with a value from the run, using the Jinja template language. Python f-strings are filled in once, when the DAG file is parsed; Jinja is filled in at run time, for each run. Inside an f-string, `{{` turns into a single `{`, which would break the Jinja `{{ }}`. That's why the templated commands are built by joining plain strings with `+` around `RUN_DATE`, and f-strings are only used where there's no Jinja (`PROJ_DIR`, `RAW_DIR`).
-
-To see exactly what was run, open a task's log in the UI. The line `Running command: ['/usr/bin/bash', '-c', '...']` shows the final command after templating.
+The `{{ ... }}` parts in `weekdays_only` and `last_update` are Jinja templates. See [Jinja Templates](#jinja-templates) for how they work.
 
 ### Bash quick reference
 
@@ -254,6 +251,115 @@ To see exactly what was run, open a task's log in the UI. The line `Running comm
 | `'...'` | Literal text, no expansion | `'*.json'` |
 | `"..."` | Text with `$VAR` expanded | `"Day of the week: $DAY"` |
 | `exit N` | End with exit code N (0 = success) | `exit 99`, `exit 1` |
+
+---
+
+## Jinja Templates
+
+**Jinja** is a templating language for Python. You write text with placeholders in it, and Jinja fills those placeholders in later. Airflow uses it so that **one task definition can adapt to each run**. The same command gets a different date, run ID and so on each time it runs.
+
+### How Airflow uses it
+
+This is what's written in the DAG file for `last_update`:
+
+```python
+bash_command="echo 'Pipeline last update for {{ (dag_run.logical_date or dag_run.run_after).strftime('%Y-%m-%d') }}'"
+```
+
+Each time the task runs, Airflow:
+
+1. Takes that string.
+2. Works out everything inside `{{ }}` using that run's details.
+3. Hands the finished command to bash, e.g. `echo 'Pipeline last update for 2026-11-25'`.
+
+Tomorrow's run gets tomorrow's date, and the code doesn't change.
+
+### Syntax
+
+| Syntax | Purpose | Example |
+|--------|---------|---------|
+| `{{ ... }}` | **Output** a value | `{{ dag_run.run_id }}` |
+| `{% ... %}` | **Logic**: if/else, loops | `{% if dag_run.run_type == 'manual' %}echo manual{% endif %}` |
+| `{# ... #}` | Comment, removed from the output | `{# why this exists #}` |
+| `\|` | **Filter**, which transforms a value | `{{ dag.dag_id \| upper }}` gives `USERS_PIPELINE_BASH` |
+
+### What you can use inside `{{ }}`
+
+**Template variables** are details about the current run:
+
+| Variable | What it is | Example value |
+|----------|------------|---------------|
+| `dag_run` | The current DAG run | `dag_run.run_id` gives `manual__2026-11-25T10:49:27…` |
+| `dag_run.logical_date` | The date the run is *for*. `None` for manual runs triggered without a date | `2026-11-25 00:00:00+00:00` |
+| `dag_run.run_after` | When the run was scheduled or triggered. Always set | `2026-11-25 10:49:27+00:00` |
+| `logical_date`, `ds` | Shortcuts for the logical date (`ds` = `YYYY-MM-DD` string). **Missing entirely** when the run has no logical date | `2026-11-25` |
+| `dag`, `task`, `ti` | The DAG, the task, and the task instance | `{{ task.task_id }}` gives `last_update` |
+| `params` | Values passed in when the DAG is triggered | `{{ params.region }}` |
+
+**Macros** are helper functions that work on those values:
+
+| Macro | What it does | Example | Result |
+|-------|--------------|---------|--------|
+| `macros.ds_add(ds, n)` | Add or subtract days from a `YYYY-MM-DD` string | `{{ macros.ds_add(ds, -7) }}` | `2026-11-18` |
+| `macros.ds_format(ds, in, out)` | Convert a date string from one format to another | `{{ macros.ds_format(ds, '%Y-%m-%d', '%u') }}` | `3` (Wednesday) |
+| `macros.datetime` / `macros.timedelta` | Python's `datetime` and `timedelta` | `{{ (dag_run.run_after - macros.timedelta(days=1)).strftime('%Y-%m-%d') }}` | the day before the run |
+| `macros.uuid`, `macros.random`, `macros.time` | Python's `uuid`, `random` and `time` modules | `{{ macros.uuid.uuid4() }}` | a unique ID |
+
+**Ordinary Python on those values** also works, such as method calls and `or`, as in `.strftime('%u')` and `logical_date or run_after`.
+
+### Why this DAG uses `dag_run.logical_date or dag_run.run_after`
+
+Runs triggered manually from the UI or CLI usually have **no logical date**. In that case Airflow leaves `ds` and `logical_date` out of the template completely. Any template that uses them fails before the command even runs:
+
+```
+UndefinedError: 'logical_date' is undefined
+```
+
+`dag_run.logical_date` is always there (it's just `None` when there's no date), so `dag_run.logical_date or dag_run.run_after` works for both scheduled and manual runs. The DAG stores this expression once as `RUN_DATE` and reuses it.
+
+Common date formats used with `.strftime()`:
+
+| Code | Meaning | Example |
+|------|---------|---------|
+| `%Y-%m-%d` | Year-month-day | `2026-11-25` |
+| `%u` | ISO weekday, 1 = Monday … 7 = Sunday | `3` |
+| `%A` | Weekday name | `Wednesday` |
+| `%H:%M` | Hour:minute (24-hour) | `10:49` |
+
+### Where templates work
+
+Only in an operator's **templated fields**. For `BashOperator`, those are `bash_command`, `env` and `cwd`. If you put `{{ ds }}` in a field that isn't templated, such as `task_id`, it stays as that literal text. Each operator's docs list its `template_fields`.
+
+Templates also don't work in plain Python code. Inside a `@task` function, read the same values from the task context instead:
+
+```python
+from airflow.sdk import get_current_context
+
+@task
+def my_task():
+    run_date = get_current_context()["dag_run"].run_after
+```
+
+### Jinja vs Python f-strings
+
+| | f-string `f"...{x}..."` | Jinja `"...{{ x }}..."` |
+|-|-------------------------|-------------------------|
+| Filled in by | Python | Airflow |
+| When | Once, when the dag-processor parses the file | Every time the task runs |
+| Knows about the run? | No | Yes: dates, run ID and so on |
+| Used in this DAG for | `PROJ_DIR`, `RAW_DIR` (fixed paths) | The run date in `weekdays_only` and `last_update` |
+
+Don't put Jinja inside an f-string. In an f-string, `{{` turns into a single `{`, so `f"{{ ds }}"` reaches Airflow as `{ ds }`, which isn't a template. That's why the templated commands are built by joining plain strings with `+`:
+
+```python
+"DAY={{ " + RUN_DATE + ".strftime('%u') }};"
+```
+
+### Seeing the filled-in result
+
+- **In the UI:** open a task instance and go to the **Rendered Template** tab. It shows the final command after Jinja ran.
+- **In the task log:** look for the line `Running command: ['/usr/bin/bash', '-c', 'DAY=3;...']`.
+- **From the CLI:** `airflow tasks render users_pipeline_bash weekdays_only 2026-11-25` prints the filled-in fields for that date without running anything.
 
 ---
 
