@@ -43,52 +43,6 @@ def clean_text(value):
     value = " ".join(str(value).split())
     return value or None
 
-# def clean_phone(value):
-#     if value is None:
-#         return None
-#     value = str(value).strip()
-
-#     if not value:
-#         return None
-#     value = re.sub(
-#         r'\s*(?:ext\.?|extension|x)\s*\d+$',
-#         '',
-#         value,
-#         flags=re.IGNORECASE
-#     )
-
-#     digits = re.sub(r'\D', '', value)
-
-#     if len(digits) == 11 and digits.startswith('1'):
-#         digits = digits[1:]
-
-#     if len(digits) < 7 or len(digits) > 15:
-#         return None
-
-#     return digits
-
-# def clean_phone(value):
-#     """Cleans phone numbers by keeping only digits, spaces, and standard phone symbols."""
-#     if value is None:
-#         return None
-#     # Remove everything except digits, plus sign, parentheses, hyphens, and spaces
-#     cleaned = re.sub(r"[^\d\+\-\(\)\s]", "", str(value))
-#     cleaned = " ".join(cleaned.split()).strip() # Normalize whitespace
-#     return cleaned or None
-
-
-# def clean_phone(value):
-#     if value is None:
-#         return None
-
-#     # Remove extension (anything from 'x' or 'ext' onward)
-#     without_ext = re.split(r"\s*(?:x|ext\.?)\s*", str(value).strip(), maxsplit=1, flags=re.IGNORECASE)[0]
-
-#     # Remove all non-digit characters (hyphens, dots, parentheses, spaces, +)
-#     digits = re.sub(r"\D", "", without_ext)
-
-#     return digits or None
-
 
 def clean_phone(value):
     if value is None:
@@ -153,7 +107,7 @@ loaded_at TIMESTAMP DEFAULT NOW()
 );
 """
 
-#Upsert (Insert new users and updataing usres incase they already exist on the database)
+#Upsert (Insert new users and updataing users incase they already exist on the database)
 UPSERT_SQL = """
 INSERT INTO users (user_id, full_name, username, email, phone, city, website)
 VALUES (%(user_id)s, %(full_name)s, %(username)s, %(email)s, %(phone)s, %(city)s, %(website)s)
