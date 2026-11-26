@@ -97,13 +97,14 @@ def users_pipeline_bash():
     summary = BashOperator(
         task_id="summary",
         bash_command=(
-            "echo 'Today: {{ ds }}' ; "
-            "echo 'Yesterday: {{ macros.ds_add(ds, -1) }}'"
+            # RUN_DATE instead of ds, so manual runs without a logical date don't fail
+            "echo 'Today: {{ " + RUN_DATE + ".strftime('%Y-%m-%d') }}' ; "
+            "echo 'Yesterday: {{ (" + RUN_DATE + " - macros.timedelta(days=1)).strftime('%Y-%m-%d') }}'"
         )
     )
 
     # weekday check comes before the load, so weekends skip run_pipeline and last_update;
-    # clean_up (trigger_rule="none_failed") still runs after a skip
-    check_files >> weekdays_only >> run_pipeline >> last_update >> clean_up
+    # clean_up (trigger_rule="none_failed") still runs after a skip, and summary runs last
+    check_files >> weekdays_only >> run_pipeline >> last_update >> clean_up >> summary
 
 users_pipeline_bash()
