@@ -395,6 +395,8 @@ Don't put Jinja inside an f-string. In an f-string, `{{` turns into a single `{`
 
 ## Setup
 
+> For a command-by-command explanation of starting, checking and stopping Airflow (what each command and flag means, and the common mistakes), see [setup.md](setup.md).
+
 ### 1. Create the Airflow home and DAGs folder
 
 ```bash
